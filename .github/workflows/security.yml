@@ -1,0 +1,221 @@
+name: Security
+
+# Reusable security backstop for the kantan-hp org. Each repo calls this with
+# only the scanners it needs (see inputs). Keeping the scanners here — rather than
+# copied into every repo — is what keeps the scanner policy (gitleaks config trust,
+# pinned images, SARIF upload) in one hardened place instead of drifting across copies.
+#
+# Caller example (.github/workflows/security.yml in a consuming repo):
+#   on: { push: { branches: [main] }, pull_request: {} }
+#   jobs:
+#     security:
+#       uses: kantan-hp/.github/.github/workflows/security.yml@main
+#       with: { gitleaks: true, semgrep: true }
+#
+# Mobile callers that want mobsfscan findings in code scanning must ALSO grant the token
+# security-events: write on the calling job — a reusable workflow cannot elevate beyond the
+# permissions the caller passes, so without this the SARIF upload 403s on public repos:
+#   jobs:
+#     security:
+#       permissions: { contents: read, security-events: write }
+#       uses: kantan-hp/.github/.github/workflows/security.yml@main
+#       with: { gitleaks: true, mobsfscan: true }
+
+on:
+  workflow_call:
+    inputs:
+      gitleaks:
+        description: "Secret scan (gitleaks). On for every repo."
+        type: boolean
+        default: true
+      semgrep:
+        description: "SAST for JS/TS (Semgrep OSS). Use on app-logic repos."
+        type: boolean
+        default: false
+      mobsfscan:
+        description: "Mobile SAST (mobsfscan). Use on iOS/Android source repos."
+        type: boolean
+        default: false
+      mobsfscan_sarif:
+        description: "Upload mobsfscan findings to GitHub code scanning (SARIF). Only takes effect when mobsfscan is also true. Auto-skips on private repos (code scanning needs GitHub Advanced Security) and on fork PRs (read-only token), so it is a safe default for every mobile caller. The calling job must grant security-events: write (a reusable workflow cannot elevate beyond the caller's token)."
+        type: boolean
+        default: true
+      actionlint:
+        description: "Lint GitHub Actions workflows (actionlint). Use on privileged CI repos."
+        type: boolean
+        default: false
+
+# Centralised cancellation policy for every caller. A fast-moving PR otherwise stacks
+# up redundant full-history scans — each new commit starts another while the previous
+# is still running. We cancel only superseded *pull_request* runs; push scans (merges
+# to a default branch) must each run to completion because they are the backstop that
+# guarantees nothing lands unscanned.
+#
+# Push runs therefore key the group on github.sha — a unique value per commit — so no
+# two pushes ever share a group. This matters: with cancel-in-progress false GitHub
+# still keeps only ONE pending run per group and cancels any older pending run, so
+# grouping pushes by ref would silently drop an intermediate merge's scan. PR runs key
+# on the PR number so every commit of a PR shares a group and the newer one cancels the
+# older. The github context reflects the CALLER's event, and concurrency groups are
+# namespaced per-repository, so the four callers never collide with one another.
+concurrency:
+  group: security-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# No workflow-level permissions block on purpose. A reusable workflow's requested
+# permissions are validated against the CALLER's granted token at startup — before any
+# `if:` can skip a job — so declaring a scope here (or on a job) that some caller does not
+# grant fails the ENTIRE run with a startup_failure, even for the jobs that caller does use.
+# Each job below requests only contents: read at the job level (within every caller's grant).
+# The mobsfscan job deliberately declares NO permissions so it inherits the caller's token:
+# a mobile caller that grants security-events: write can then upload SARIF, without forcing
+# every non-mobile caller (gitleaks/semgrep/actionlint-only) to grant that scope.
+
+# All scan jobs run on GitHub-hosted ubuntu-latest (free for public repos, and no
+# external runner fleet to manage). No fork guard needed: gitleaks/semgrep/actionlint
+# never touch repo secrets, and mobsfscan's SARIF upload gates on public + non-fork.
+# The mobsfscan job deliberately declares NO permissions so it inherits the caller's
+# token: a mobile caller that grants security-events: write can then upload SARIF,
+# without forcing every non-mobile caller (gitleaks/semgrep/actionlint-only) to grant
+# that scope.
+
+jobs:
+  gitleaks:
+    if: ${{ inputs.gitleaks }}
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # cap so a hung scanner can't hold a runner indefinitely
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so we can read .gitleaks.toml from the PR's base commit.
+          fetch-depth: 0
+      - name: Resolve a trusted gitleaks config
+        id: glcfg
+        # gitleaks auto-loads `<source>/.gitleaks.toml`. On pull_request that working
+        # tree is attacker-controlled, so a PR could add a config that allowlists
+        # everything and pass the scan while leaking. We pin --config to a copy taken
+        # from the BASE ref (which the PR cannot change); fall back to the repo's own
+        # config only when the base has none yet (the PR that first introduces it), and
+        # to the gitleaks default ruleset when there is no repo config at all. Because
+        # --config is always set, gitleaks never silently honours an attacker-supplied
+        # /repo/.gitleaks.toml.
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/gitleaks-config"
+          mkdir -p "$dest"
+          out="$dest/.gitleaks.toml"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+            if git cat-file -e "$base:.gitleaks.toml" 2>/dev/null; then
+              git show "$base:.gitleaks.toml" > "$out"
+            elif [ -f .gitleaks.toml ]; then
+              cp .gitleaks.toml "$out"
+            fi
+          elif [ -f .gitleaks.toml ]; then
+            cp .gitleaks.toml "$out"
+          fi
+          if [ ! -f "$out" ]; then
+            printf '[extend]\nuseDefault = true\n' > "$out"
+          fi
+          echo "dir=$dest" >> "$GITHUB_OUTPUT"
+      - name: Scan git history for secrets
+        env:
+          # renovate: datasource=docker
+          GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1
+        # Scan the full commit HISTORY (git mode), not just the checked-out tree. A secret
+        # added in one commit and removed before the final tree still lives in history and is
+        # exposed if/when the repo goes public, so --no-git (directory mode) would miss exactly
+        # the leak this backstop must catch. Requires fetch-depth: 0 above. GIT_CONFIG
+        # safe.directory avoids git's "dubious ownership" error for the host-mounted repo.
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            -v "${{ steps.glcfg.outputs.dir }}:/gitleaks-config:ro" \
+            -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory \
+            -e GIT_CONFIG_VALUE_0=/repo \
+            "$GITLEAKS_IMAGE" \
+            detect --source=/repo --config=/gitleaks-config/.gitleaks.toml \
+            --no-banner --redact --exit-code=1
+
+  semgrep:
+    if: ${{ inputs.semgrep }}
+    name: semgrep (SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # cap so a hung scanner can't hold a runner indefinitely
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep:1.169.0
+    steps:
+      - uses: actions/checkout@v7
+      - name: Semgrep OSS scan
+        run: |
+          semgrep scan --error --metrics off \
+            --config p/typescript --config p/javascript --config p/secrets .
+
+  mobsfscan:
+    if: ${{ inputs.mobsfscan }}
+    name: mobsfscan (mobile SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # cap so a hung scanner can't hold a runner indefinitely
+    # No permissions block on purpose: this job inherits the CALLER's token. A mobile caller
+    # that grants security-events: write (see the header example) thereby enables the SARIF
+    # upload step below. Declaring security-events: write here instead would force EVERY
+    # caller — including gitleaks/semgrep/actionlint-only ones — to grant it or hit a
+    # startup_failure, because reusable-workflow permissions are validated before `if:` runs.
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Run mobsfscan
+        # mobile-specific static analysis (insecure storage, weak crypto, ATS, etc.).
+        # --no-fail reports findings without failing the build while the ruleset beds in, but a
+        # genuine scanner error (bad args, crash) still exits non-zero and fails the job — this
+        # is deliberately NOT a blanket `|| true`, which would mask a broken scan as a green
+        # no-op. Promote findings to a required gate (drop --no-fail) once the signal is trusted.
+        run: |
+          python -m pip install --upgrade pip
+          pip install mobsfscan
+          # Human-readable report to the job log FIRST, so findings stay visible everywhere —
+          # including on private repos and fork PRs, where the SARIF upload step below is
+          # skipped. Writing SARIF straight to a file with --output prints nothing to the
+          # console, so without this the scan would be a silent no-op wherever upload is skipped.
+          mobsfscan --no-fail .
+          # Then emit SARIF for the code-scanning upload (next step; gated to public non-fork).
+          mobsfscan --no-fail --sarif --output mobsfscan.sarif .
+      - name: Upload SARIF to code scanning
+        # Preserves the capability the vendored iOS security.yml copies carried before
+        # they converged onto this reusable workflow. Skip on fork pull requests: their
+        # read-only token cannot write security events, so the upload would error. Also
+        # skip on private repos (e.g. the internal mirrors): code scanning needs GitHub
+        # Advanced Security there, so upload-sarif 403s ("Resource not accessible by
+        # integration") and would fail the job. Public repos get code scanning for free.
+        # NOTE: the calling job must grant security-events: write — a reusable workflow
+        # cannot elevate beyond the caller's token, so on a least-privilege caller this
+        # upload would 403 without it (see the caller example in the header).
+        if: ${{ always() && inputs.mobsfscan_sarif && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && github.event.repository.visibility == 'public' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: mobsfscan.sarif
+          category: mobsfscan
+
+  actionlint:
+    if: ${{ inputs.actionlint }}
+    name: actionlint (workflow lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # cap so a hung scanner can't hold a runner indefinitely
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Lint workflows
+        env:
+          # renovate: datasource=docker
+          ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo "$ACTIONLINT_IMAGE" -color
