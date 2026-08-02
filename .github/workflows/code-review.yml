@@ -1,0 +1,785 @@
+name: Code Review
+
+# Reusable AI code-review backstop for the kantan-hp org, powered by
+# alibaba/open-code-review (OCR). Like the security workflow, the logic lives
+# here once and each repo calls it with only its API-key secret rather than
+# copying the whole pipeline into every repo.
+#
+# Runs on public and private repos. Auto-review vs on-demand is controlled by each
+# CALLER's triggers, not here: public repos call this on `pull_request` (auto) plus
+# `issue_comment`; private repos call it on `issue_comment` only, so it stays suspended
+# until someone tags /open-code-review on a PR (no per-PR Actions cost). The security
+# guards below (same-repo heads, trusted commenters) are independent of visibility.
+#
+# Caller example (.github/workflows/code-review.yml in a consuming repo):
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened]
+#     issue_comment:
+#       types: [created]
+#   jobs:
+#     code-review:
+#       permissions:
+#         contents: read
+#         pull-requests: write
+#       uses: kantan-hp/.github/.github/workflows/code-review.yml@main
+#       secrets:
+#         llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+
+on:
+  workflow_call:
+    inputs:
+      llm_url:
+        description: "LLM endpoint. Defaults to the OpenCode Go plan's OpenAI-compatible API. Override (with a matching llm_model + key) to point at another provider."
+        type: string
+        default: "https://opencode.ai/zen/go/v1"
+      llm_model:
+        description: "Model to review with. Defaults to MiniMax M3 on the OpenCode Go plan. This is the bare API model id (minimax-m3), NOT the opencode-go/ config-prefixed form — OCR sends it verbatim to the OpenAI-compatible /chat/completions endpoint, which rejects the prefixed slug."
+        type: string
+        default: "minimax-m3"
+      use_anthropic:
+        description: "Speak the Anthropic protocol. False for the OpenCode Go plan (OpenAI-compatible); true for e.g. z.ai's /api/anthropic endpoint."
+        type: boolean
+        default: false
+      ocr_version:
+        description: "Pin @alibaba-group/open-code-review to a version. Empty = latest."
+        type: string
+        default: ""
+    secrets:
+      llm_auth_token:
+        description: "API key for the configured LLM endpoint (e.g. your OpenCode Go API key)."
+        required: true
+
+# One review per PR; a new push cancels the superseded run so rapid pushes don't
+# stack full reviews (and burn API quota). The group key includes the event name so
+# comment-triggered runs (issue_comment) sit in a separate group from push-triggered
+# reviews (pull_request): otherwise any PR comment — another bot's review summary, or a
+# /command aimed at a different tool — enters the shared group and cancels the in-flight
+# review before skipping itself on the trigger guard below.
+concurrency:
+  group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-review:
+    # Private caller → Ubicloud (ubicloud-standard-2, overridable via the caller's LINUX_CI_RUNNER
+    # var); public repo or fork PR → GitHub-hosted ubuntu-latest — IDENTICAL to security.yml. The
+    # fork gate covers pull_request events; the issue_comment path (how private callers trigger this)
+    # carries no fork status at allocation time, so fork heads there are refused in the "Get PR
+    # context" step below, before any fork code is checked out with the review secrets (OCR #29).
+    # See lavasec-infra plans/2026-07-08-linux-ci-runner-cost-plan.md.
+    runs-on: ${{ (github.event.repository.private && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)) && fromJSON(vars.LINUX_CI_RUNNER || '["ubicloud-standard-2"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 30  # cap so a hung/looping review can't hold a self-hosted (Ubicloud) worker (OCR #29)
+    # Runs for:
+    #   * a same-repo PR (fork heads never receive the secret, so they'd fail
+    #     the config/review/post steps on an empty token — skip them cleanly), or
+    #   * an explicit /open-code-review (or @open-code-review) comment on a PR
+    #     from a trusted user (OWNER/MEMBER/COLLABORATOR) so arbitrary commenters
+    #     can't spend the API key.
+    # No visibility gate here: public vs private is governed by the caller's triggers
+    # (private callers use issue_comment only, so they run only when tagged). The
+    # same-repo and trusted-commenter guards below are the security-relevant ones.
+    if: >-
+      ( ( github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository ) ||
+        ( github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request &&
+          ( startsWith(github.event.comment.body, '/open-code-review') ||
+            startsWith(github.event.comment.body, '@open-code-review') ) &&
+          ( github.event.comment.author_association == 'OWNER' ||
+            github.event.comment.author_association == 'MEMBER' ||
+            github.event.comment.author_association == 'COLLABORATOR' ) ) )
+    steps:
+      # For comment-triggered runs there is no pull_request in the payload, so
+      # resolve the PR's base/head from the API.
+      - name: Get PR context
+        id: pr-context
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            // Fork guard (OCR #29): the on-demand issue_comment path resolves the PR here, BEFORE
+            // checkout — so refuse fork heads before any untrusted code runs with the review
+            // secrets. The pull_request auto-review path already gates same-repo in the job `if:`;
+            // this mirrors it for issue_comment, which the `if:` can't (the comment payload carries
+            // no head.repo). Matters most on private repos, whose runner is the self-hosted Ubicloud
+            // fleet, but the checkout+secrets exposure is runner-independent, so gate uniformly.
+            // head.repo is null when the fork was deleted (stale PRs) — still not same-repo, so
+            // refuse, but with the same helpful message rather than a "Cannot read null" crash (OCR #29).
+            const baseFull = `${context.repo.owner}/${context.repo.repo}`;
+            if (!pullRequest.head.repo || pullRequest.head.repo.full_name !== baseFull) {
+              const headFull = pullRequest.head.repo ? pullRequest.head.repo.full_name : '<deleted fork>';
+              core.setFailed(`Refusing on-demand review of a fork PR (head ${headFull} != ${baseFull}): it would check out untrusted code with the review secrets. Push the branch to ${baseFull} and review from there.`);
+              return;
+            }
+            core.setOutput('base_ref', pullRequest.base.ref);
+            core.setOutput('head_ref', pullRequest.head.ref);
+            core.setOutput('head_sha', pullRequest.head.sha);
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || steps.pr-context.outputs.head_sha }}
+
+      - name: Fetch PR head ref
+        run: git fetch origin "pull/${{ github.event.pull_request.number || github.event.issue.number }}/head"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install OpenCodeReview
+        env:
+          OCR_VERSION: ${{ inputs.ocr_version }}
+        run: |
+          if [ -n "$OCR_VERSION" ]; then
+            npm install -g "@alibaba-group/open-code-review@${OCR_VERSION}"
+          else
+            npm install -g @alibaba-group/open-code-review
+          fi
+          echo "OpenCodeReview installed with version:"
+          ocr version || true
+
+      - name: Configure OCR
+        env:
+          OCR_LLM_URL: ${{ inputs.llm_url }}
+          OCR_LLM_MODEL: ${{ inputs.llm_model }}
+          OCR_USE_ANTHROPIC: ${{ inputs.use_anthropic }}
+          OCR_LLM_AUTH_TOKEN: ${{ secrets.llm_auth_token }}
+        run: |
+          ocr config set llm.url "$OCR_LLM_URL"
+          ocr config set llm.auth_token "$OCR_LLM_AUTH_TOKEN"
+          ocr config set llm.model "$OCR_LLM_MODEL"
+          ocr config set llm.use_anthropic "$OCR_USE_ANTHROPIC"
+
+      # Org-default review policy, dropped into the checked-out caller repo. The rule entry
+      # deliberately OMITS merge_system_rule: with it absent the policy text fully REPLACES
+      # OCR's built-in per-language checklist instead of being appended to it. The previous
+      # merge_system_rule:true form kept the built-in checklist alongside our focus text, and
+      # the two contradict — the built-in generic checklist (which every .swift file resolves
+      # to; OCR has no Swift-specific entry) mandates "Test Coverage" review, which drove the
+      # test-strictness comment flood the focus text tried to ban. Audit of the 163 OCR
+      # comments on lavasec-ios #69/#70: 8% signal, 60% noise; 51% of comments hinged on
+      # hypothetical future edits, 43% were test-strictness ratchets, and 28% of #69's volume
+      # was cross-round re-raises. The policy below targets each measured failure mode; the
+      # per-FILE comment cap is per-file because OCR reviews file-by-file, so a per-review cap
+      # is unenforceable from the checklist.
+      # The policy lives in a sibling .md the rule points at (OCR resolves a single-line,
+      # no-spaces .md rule value as a file path vs the repo root) so it stays readable here.
+      # Skip if the caller ships its own .opencodereview/rule.json so we never clobber a
+      # repo's intentional customization. Written to the workspace, not committed; it does
+      # not affect the reviewed diff (origin/base..head).
+      - name: Add precision-first review rule
+        run: |
+          if [ -f .opencodereview/rule.json ]; then
+            echo ".opencodereview/rule.json already present in caller repo; leaving it untouched."
+            exit 0
+          fi
+          mkdir -p .opencodereview
+          cat > .opencodereview/review-policy.md <<'POLICY'
+          You are reviewing a diff for defects. Optimize for precision, not recall: a false
+          alarm costs more reviewer trust than a missed minor issue. If you are not confident
+          an issue is real and worth a maintainer's time, do not comment. Prefer zero
+          comments over marginal ones.
+
+          Report ONLY:
+          - Correctness or logic errors, security flaws, data loss, crashes, resource or
+            lifecycle leaks, concurrency races, unhandled errors, and API misuse - each with
+            a concrete failure scenario reachable with the code and constant values AS
+            WRITTEN in this diff.
+          - In test files: ONLY a test that cannot fail for the behavior it claims to verify
+            (vacuous assertion, wrong symbol or file, or a regression it could never catch).
+            A test that verifies its claim but could be stricter, more symmetric, more
+            local, or better anchored is NOT a finding.
+
+          Never report:
+          - Hypothetical-future issues: anything that only becomes a defect if constants,
+            callers, or structure change later ("if a future refactor...", "a future caller
+            might..."). If the failure requires an edit that is not in this diff, do not
+            post it.
+          - Documented tradeoffs: if a nearby comment, docstring, or the diff itself
+            acknowledges the limitation or residual as accepted, it is a decision, not a
+            defect - do not re-litigate it.
+          - Cosmetics: formatting, naming, imports, comment or documentation wording or
+            accuracy, structure preferences, consistency-with-sibling nits, micro-
+            performance without measurable impact, missing validation for inputs no current
+            caller produces, or suggestions to add comments, docs, or tests.
+          - Unverified premises: before claiming a race or lifecycle bug, confirm the
+            execution context (actor isolation, queue, caller guards) from the source you
+            can see. If the premise depends on context you did not confirm, do not post.
+
+          Severity, as the first characters of every comment:
+          - [P1] a live defect a user can hit in the shipped product (data loss, security,
+            crash, wrong behavior).
+          - [P2] a real correctness risk in the code as written, or a genuinely vacuous test.
+          - [P3] rare: a minor but concretely actionable defect. Never [P3] for style or
+            "could be stricter".
+          Never emit a finding without a severity tag.
+
+          Limits: at most 2 comments per file - if you have more candidates, post only the
+          most severe and silently drop the rest. One comment per root cause (name other
+          affected sites within it; never post near-duplicates). At most 4 sentences per
+          comment: the defect, the concrete failure scenario, the fix. Do not restate the
+          code's own comments, narrate your analysis, or post observations that conclude no
+          change is needed - if no change is needed, post nothing.
+          POLICY
+          cat > .opencodereview/rule.json <<'JSON'
+          {
+            "rules": [
+              {
+                "path": "**/*",
+                "rule": ".opencodereview/review-policy.md"
+              }
+            ]
+          }
+          JSON
+          echo "Wrote .opencodereview/rule.json:"
+          cat .opencodereview/rule.json
+          echo "Wrote .opencodereview/review-policy.md:"
+          cat .opencodereview/review-policy.md
+
+      - name: Run OpenCodeReview
+        id: review
+        # Values come from the event payload (branch names can contain shell
+        # metacharacters), so route them through env rather than inline ${{ }}.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_BEFORE: ${{ github.event.before }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CTX_BASE_REF: ${{ steps.pr-context.outputs.base_ref }}
+          CTX_HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE_REF="$PR_BASE_REF"
+            HEAD_SHA="$PR_HEAD_SHA"
+          else
+            BASE_REF="$CTX_BASE_REF"
+            HEAD_SHA="$CTX_HEAD_SHA"
+          fi
+
+          # Default: review the WHOLE PR diff (base..head). The first review (opened/reopened) and
+          # every on-demand issue_comment run always look at the entire PR.
+          FROM_REF="origin/${BASE_REF}"
+
+          # Incremental: on a `synchronize` push (a new push to an already-open PR) review ONLY the
+          # commits added since the previous head, so a long-lived PR isn't re-reviewed end-to-end on
+          # every push (which re-surfaces the same findings and drowns the genuinely-new ones — the
+          # noise calibrated from the lavasec-ios sync PRs). The `pull_request.synchronize` payload
+          # carries `before`/`after`; diff `before..HEAD` when those added commits are all PR commits.
+          # Falls back to the full base..head diff whenever `before` is unusable — a zero SHA (branch
+          # (re)created), a force-pushed old head GitHub has already GC'd so we can't fetch it, or a
+          # base-update push whose range would drag in base-branch commits (see the inner guard) — so
+          # we NEVER review an empty or bogus range;
+          # the failure mode is "full review", never a broken one. NOTE (recall trade-off): a later
+          # push does not re-scan earlier files, so this leans on each file being reviewed when it
+          # first lands, on Codex/Kilo, and on `/open-code-review` for an explicit full re-review.
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$PR_ACTION" = "synchronize" ] \
+             && [ -n "$PR_BEFORE" ] \
+             && [ "$PR_BEFORE" != "0000000000000000000000000000000000000000" ] \
+             && { [[ "$PR_BEFORE" =~ ^[0-9a-f]{40}$ ]] || [[ "$PR_BEFORE" =~ ^[0-9a-f]{64}$ ]]; }; then
+            # PR_BEFORE must be a full commit hash (SHA-1 40-hex or SHA-256 64-hex) before it is
+            # handed to `git fetch` — a non-SHA value would be interpreted as a refspec and fetched.
+            # GitHub always sets `before` to a SHA on pull_request.synchronize; this is defense in
+            # depth so a future payload change / misrouted event forces the full-review fallback
+            # rather than fetching an arbitrary ref.
+            if git fetch --no-tags origin "$PR_BEFORE" 2>/dev/null \
+               && git cat-file -e "${PR_BEFORE}^{commit}" 2>/dev/null; then
+              # Use the prior head as the incremental base ONLY when EVERY commit added since it is a
+              # genuine PR commit — i.e. none are reachable from the current base. A `synchronize`
+              # fired by a BASE UPDATE ("Update branch" merge, or a rebase onto a newer base) pulls
+              # base commits into before..HEAD, and OCR does a two-endpoint TREE diff
+              # (git diff before HEAD), so those base changes would otherwise be reviewed as the PR
+              # delta (Codex on lavasecurity/.github#35). When the range holds any base commit — or is
+              # empty — fall back to the full origin/base..HEAD diff.
+              ADDED_TOTAL=$(git rev-list --count "${PR_BEFORE}..${HEAD_SHA}" 2>/dev/null || echo 0)
+              ADDED_PR_ONLY=$(git rev-list --count "${PR_BEFORE}..${HEAD_SHA}" "^origin/${BASE_REF}" 2>/dev/null || echo 0)
+              if [ "$ADDED_TOTAL" -gt 0 ] && [ "$ADDED_TOTAL" -eq "$ADDED_PR_ONLY" ]; then
+                FROM_REF="$PR_BEFORE"
+                echo "Incremental review: ${ADDED_TOTAL} commit(s) since prior head ${PR_BEFORE}."
+              else
+                echo "synchronize brought in base commits or added nothing (total=${ADDED_TOTAL}, pr-only=${ADDED_PR_ONLY}); reviewing the full PR diff."
+              fi
+            else
+              echo "Prior head ${PR_BEFORE} unavailable (GC'd / force-push); reviewing the full PR diff."
+            fi
+          fi
+
+          echo "Reviewing ${HEAD_SHA} against ${FROM_REF}"
+          ocr review \
+            --from "${FROM_REF}" \
+            --to "${HEAD_SHA}" \
+            --format json \
+            > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log || true
+          echo "=== OCR output ==="
+          cat /tmp/ocr-result.json
+          echo "=== OCR stderr ==="
+          cat /tmp/ocr-stderr.log
+
+      # Posts OCR's findings as one PR review with inline comments. Before posting, new
+      # inline comments are deduplicated POSITIONALLY (path + line-range) against THIS
+      # WORKFLOW'S existing inline comments on the PR — recognized by a hidden provenance
+      # marker stamped on every comment we post (legacy pre-marker comments by their
+      # mandated [P1-3] prefix), NOT by the shared github-actions[bot] login alone, so
+      # other workflows' comments never suppress a finding: OCR itself never reads PR
+      # state, so every
+      # synchronize re-review re-raised prior findings — 28% of the 113-comment volume on
+      # lavasec-ios#69 was cross-round re-raises. Semantics mirror upstream's bundled-action
+      # `incremental` mode: two single-line comments match on the same line, two multi-line
+      # comments match at line-range IoU >= 0.6, and single-vs-multi never match. Within-run
+      # duplicates (the model occasionally emits the same finding twice in one review, seen
+      # on lavasec-ios#70) are dropped by the same rule. Accepted tradeoffs for an advisory
+      # reviewer: a genuinely NEW issue on an already-commented range is suppressed, and
+      # line drift from force-pushes/rebases can re-expose old findings (outdated comments
+      # match at their original_line). A run whose findings are ALL suppressed posts nothing
+      # at all — no summary — so repeat pushes don't accumulate timeline noise; if listing
+      # existing comments fails, the run posts everything rather than dropping findings.
+      - name: Post review comments to PR
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = '/tmp/ocr-result.json';
+
+            // Provenance stamp appended (invisibly) to every inline comment this workflow
+            // posts, so dedup can recognize its own history without claiming comments from
+            // other github-actions workflows (Codex on #38). Legacy comments posted before
+            // the marker existed are recognized by the [P1]/[P2]/[P3] severity prefix the
+            // review policy has always mandated.
+            const OCR_MARKER = '<!-- opencodereview -->';
+
+            let result;
+            try {
+              const raw = fs.readFileSync(path, 'utf8');
+              result = JSON.parse(raw);
+            } catch (e) {
+              console.log('Failed to parse OCR output:', e.message);
+              const stderr = fs.readFileSync('/tmp/ocr-stderr.log', 'utf8').trim();
+              if (stderr) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: `⚠️ **OpenCodeReview** encountered an error:\n${fencedBlock(stderr)}`
+                });
+              }
+              return;
+            }
+
+            const comments = result.comments || [];
+            const warnings = result.warnings || [];
+
+            if (comments.length === 0) {
+              const message = result.message || 'No comments generated. Looks good to me.';
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `✅ **OpenCodeReview**: ${message}`
+              });
+              return;
+            }
+
+            const prNumber = context.issue.number;
+            let commitSha;
+
+            if (context.eventName === 'pull_request') {
+              commitSha = context.payload.pull_request.head.sha;
+            } else {
+              const { data: pullRequest } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+              commitSha = pullRequest.head.sha;
+            }
+
+            // Ranges of the bot's existing inline comments, for positional dedup. Replies
+            // and outdated comments count too: a re-raise on a thread the author already
+            // disposed of is exactly the noise this suppresses. Failure here is non-fatal —
+            // the fallback is "post everything", never "drop findings".
+            let historyRanges = [];
+            try {
+              const existing = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                per_page: 100
+              });
+              historyRanges = existing
+                .filter(c => c.user && c.user.login === 'github-actions[bot]'
+                  && (String(c.body || '').includes(OCR_MARKER) || /^\s*\[P[1-3]\]/.test(c.body || '')))
+                .map(c => {
+                  const end = c.line != null ? c.line : c.original_line;
+                  if (end == null) return null;
+                  const start = c.start_line != null ? c.start_line
+                    : (c.original_start_line != null ? c.original_start_line : end);
+                  return { path: c.path, start, end };
+                })
+                .filter(Boolean);
+              console.log(`Loaded ${historyRanges.length} existing bot inline-comment range(s) for dedup.`);
+            } catch (e) {
+              console.log('Could not list existing review comments; skipping cross-run dedup:', e.message);
+            }
+
+            const reviewComments = [];
+            const commentsWithoutLine = [];
+            const acceptedRanges = [];
+            let suppressedCount = 0;
+
+            for (const comment of comments) {
+              const body = formatComment(comment);
+
+              const hasValidLine = (comment.start_line >= 1) || (comment.end_line >= 1);
+              if (!hasValidLine) {
+                commentsWithoutLine.push({ comment, body });
+                continue;
+              }
+
+              const range = commentRange(comment);
+              const dup = historyRanges.find(r => rangesOverlap(r, range))
+                || acceptedRanges.find(r => rangesOverlap(r, range));
+              if (dup) {
+                suppressedCount++;
+                console.log(`Suppressing duplicate at ${range.path}:${range.start}-${range.end} (overlaps existing ${dup.path}:${dup.start}-${dup.end}).`);
+                continue;
+              }
+              acceptedRanges.push(range);
+
+              const reviewComment = {
+                path: comment.path,
+                body: body
+              };
+
+              if (comment.start_line >= 1 && comment.end_line >= 1 && comment.start_line !== comment.end_line) {
+                reviewComment.start_line = comment.start_line;
+                reviewComment.line = comment.end_line;
+                reviewComment.start_side = 'RIGHT';
+                reviewComment.side = 'RIGHT';
+              } else if (comment.end_line >= 1) {
+                reviewComment.line = comment.end_line;
+                reviewComment.side = 'RIGHT';
+              } else if (comment.start_line >= 1) {
+                reviewComment.line = comment.start_line;
+                reviewComment.side = 'RIGHT';
+              }
+
+              reviewComments.push({ comment, reviewComment });
+            }
+
+            if (reviewComments.length === 0 && commentsWithoutLine.length === 0) {
+              console.log(`All ${suppressedCount} comment(s) suppressed as duplicates of existing review comments; posting nothing.`);
+              return;
+            }
+
+            const totalCount = comments.length;
+            const inlineCount = reviewComments.length;
+            const summaryCount = commentsWithoutLine.length;
+            let summaryBody = buildSummaryBody(totalCount, inlineCount, summaryCount, warnings, suppressedCount);
+
+            summaryBody += formatSummaryComments(commentsWithoutLine);
+
+            let successCount = 0;
+            let failedCount = 0;
+            const failedComments = [];
+
+            try {
+              const batchRes = await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                commit_id: commitSha,
+                body: summaryBody,
+                event: 'COMMENT',
+                comments: reviewComments.map(({ reviewComment }) => reviewComment)
+              });
+              successCount = reviewComments.length;
+              console.log(`Successfully posted review with ${successCount} inline comments (${commentsWithoutLine.length} in summary)`);
+              logRateLimitQuota(batchRes, 'after batch createReview');
+            } catch (e) {
+              console.log('Failed to post review with inline comments:', e.message);
+              console.log('Falling back to posting comments individually with rate-limit-aware retry...');
+
+              const MAX_RETRIES = parseInt(process.env.OCR_MAX_RETRIES, 10) || 3;
+              const SUCCESS_DELAY = parseInt(process.env.OCR_SUCCESS_DELAY, 10) || 2000;
+              const FAILURE_DELAY = parseInt(process.env.OCR_FAILURE_DELAY, 10) || 1000;
+              const LOW_REMAINING_THRESHOLD = parseInt(process.env.OCR_LOW_REMAINING_THRESHOLD, 10) || 3;
+              const LOW_REMAINING_SPACING = parseInt(process.env.OCR_LOW_REMAINING_SPACING, 10) || 10000;
+
+              const batchRetry = computeRetryDelayMs(e, 0);
+              if (batchRetry != null) {
+                const secs = (batchRetry.delayMs / 1000).toFixed(1);
+                console.log(
+                  `Batch createReview was rate-limited (HTTP ${e.status}). ` +
+                  `Cooling down ${secs}s via '${batchRetry.source}' (${batchRetry.detail}) before per-comment retry.`
+                );
+                await sleep(batchRetry.delayMs);
+              }
+
+              for (const { comment, reviewComment } of reviewComments) {
+                let posted = false;
+                for (let attempt = 0; attempt <= MAX_RETRIES && !posted; attempt++) {
+                  try {
+                    const res = await github.rest.pulls.createReview({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      pull_number: prNumber,
+                      commit_id: commitSha,
+                      body: '',
+                      event: 'COMMENT',
+                      comments: [reviewComment]
+                    });
+                    successCount++;
+                    posted = true;
+                    console.log(`Successfully posted comment for ${reviewComment.path}`);
+                    const remaining = logRateLimitQuota(res, `after ${reviewComment.path}`);
+                    const lowQuota = remaining != null && remaining <= LOW_REMAINING_THRESHOLD;
+                    if (lowQuota) {
+                      console.log(`[rate-limit] quota low (remaining=${remaining} <= ${LOW_REMAINING_THRESHOLD}); increasing spacing to ${LOW_REMAINING_SPACING}ms.`);
+                      await sleep(LOW_REMAINING_SPACING);
+                    } else {
+                      await sleep(SUCCESS_DELAY);
+                    }
+                  } catch (innerE) {
+                    const retryInfo = computeRetryDelayMs(innerE, attempt);
+                    const willRetry = retryInfo != null && attempt < MAX_RETRIES;
+                    if (willRetry) {
+                      const secs = (retryInfo.delayMs / 1000).toFixed(1);
+                      console.log(
+                        `Rate-limited/transient error on ${reviewComment.path} ` +
+                        `(HTTP ${innerE.status}, attempt ${attempt + 1}/${MAX_RETRIES}). ` +
+                        `Waiting ${secs}s via '${retryInfo.source}' (${retryInfo.detail}). ` +
+                        `Error: ${innerE.message}`
+                      );
+                      await sleep(retryInfo.delayMs);
+                    } else {
+                      failedCount++;
+                      failedComments.push({ comment, error: innerE.message });
+                      const reason = retryInfo == null ? 'non-retryable error' : 'rate-limit retries exhausted';
+                      console.log(`Failed to post comment for ${reviewComment.path} (${reason}, HTTP ${innerE.status || 'n/a'}): ${innerE.message}`);
+                      await sleep(retryInfo == null ? FAILURE_DELAY : SUCCESS_DELAY);
+                      break;
+                    }
+                  }
+                }
+              }
+
+              let finalBody = buildSummaryBody(totalCount, successCount, commentsWithoutLine.length + failedComments.length, warnings, suppressedCount);
+              finalBody += formatSummaryComments(commentsWithoutLine);
+              finalBody += `\n\n---\n\n📊 **Posting Statistics:**`;
+              finalBody += `\n- ✅ Successfully posted: ${successCount} comment(s)`;
+              if (failedCount > 0) {
+                finalBody += `\n- ❌ Failed to post: ${failedCount} comment(s)`;
+              }
+
+              if (failedComments.length > 0) {
+                finalBody += '\n\n---\n\n### ⚠️ Inline comments shown in summary';
+                for (const { comment, error } of failedComments) {
+                  finalBody += '\n\n---\n\n';
+                  finalBody += formatCommentMarkdown(comment, error);
+                }
+              }
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: finalBody
+              });
+            }
+
+            function sleep(ms) {
+              return new Promise(resolve => setTimeout(resolve, ms));
+            }
+
+            // Mirrors the multi-line-vs-single-line decision the posting code makes below,
+            // so a comment is deduplicated against exactly the range it would occupy.
+            function commentRange(comment) {
+              const end = comment.end_line >= 1 ? comment.end_line : comment.start_line;
+              const start = (comment.start_line >= 1 && comment.end_line >= 1 && comment.start_line !== comment.end_line)
+                ? comment.start_line
+                : end;
+              return { path: comment.path, start, end };
+            }
+
+            // Upstream bundled-action `incremental` semantics: same line for two
+            // single-line comments; IoU >= 0.6 for two multi-line comments; a single-line
+            // and a multi-line comment never match.
+            function rangesOverlap(a, b) {
+              if (a.path !== b.path) return false;
+              const aSingle = a.start === a.end;
+              const bSingle = b.start === b.end;
+              if (aSingle !== bSingle) return false;
+              if (aSingle) return a.start === b.start;
+              const interStart = Math.max(a.start, b.start);
+              const interEnd = Math.min(a.end, b.end);
+              const inter = Math.max(0, interEnd - interStart + 1);
+              if (inter === 0) return false;
+              const union = (a.end - a.start + 1) + (b.end - b.start + 1) - inter;
+              return inter / union >= 0.6;
+            }
+
+            function getHeader(headers, name) {
+              const v = headers[name] != null ? headers[name] : headers[name.toLowerCase()];
+              return v != null ? String(v).trim() : undefined;
+            }
+
+            function computeRetryDelayMs(error, attempt) {
+              if (!error) return null;
+              const status = error.status;
+              const message = String(error.message || '');
+              const isRateLimit = status === 429 || (status === 403 && /rate limit|abuse|secondary/i.test(message));
+              const isTransient = (status >= 500 && status < 600) || status === 408;
+              if (!isRateLimit && !isTransient) return null;
+
+              const headers = ((error.response || {}).headers) || {};
+              const header = (name) => getHeader(headers, name);
+              const nowSec = Math.floor(Date.now() / 1000);
+
+              const cap = parseInt(process.env.OCR_RETRY_MAX_DELAY, 10) || 300000;
+              const base = parseInt(process.env.OCR_RETRY_BASE_DELAY, 10) || 60000;
+
+              let info = null;
+
+              if (isRateLimit) {
+                const retryAfter = header('retry-after');
+                if (retryAfter) {
+                  const secs = Number(retryAfter);
+                  if (!isNaN(secs) && secs >= 0) {
+                    info = { rawMs: secs * 1000, source: 'retry-after', detail: `${secs}s (from header)` };
+                  } else {
+                    const dateMs = Date.parse(retryAfter);
+                    if (!isNaN(dateMs)) {
+                      info = { rawMs: Math.max(0, dateMs - Date.now()), source: 'retry-after (HTTP-date)', detail: retryAfter };
+                    }
+                  }
+                }
+
+                if (!info) {
+                  const remaining = header('x-ratelimit-remaining');
+                  const reset = header('x-ratelimit-reset');
+                  if (reset != null && Number(remaining) === 0) {
+                    const rawMs = Math.max(0, Number(reset) - nowSec) * 1000;
+                    info = { rawMs, source: 'x-ratelimit-reset', detail: `remaining=0, reset epoch=${reset} (in ${Math.ceil(rawMs / 1000)}s)` };
+                  }
+                }
+
+                if (!info) {
+                  const backoff = Math.min(base * Math.pow(2, attempt), cap);
+                  const jitter = Math.floor(Math.random() * 1000);
+                  info = { rawMs: backoff + jitter, source: 'exponential-backoff', detail: `base=${base}ms*2^${attempt} (cap ${cap}ms) +${jitter}ms jitter` };
+                }
+              } else {
+                const transientBase = 2000;
+                const backoff = Math.min(transientBase * Math.pow(2, attempt), cap);
+                const jitter = Math.floor(Math.random() * 1000);
+                info = { rawMs: backoff + jitter, source: 'transient-backoff', detail: `base=${transientBase}ms*2^${attempt} (cap ${cap}ms) +${jitter}ms jitter (HTTP ${status})` };
+              }
+
+              const delayMs = Math.min(info.rawMs, cap);
+              if (delayMs < info.rawMs) {
+                info.detail += ` [CAPPED to ${cap}ms; GitHub recommended ${Math.ceil(info.rawMs / 1000)}s]`;
+              }
+              return { delayMs, source: info.source, detail: info.detail };
+            }
+
+            function logRateLimitQuota(response, tag) {
+              try {
+                const h = (response && response.headers) || {};
+                const header = (name) => getHeader(h, name);
+                const remaining = header('x-ratelimit-remaining');
+                const limit = header('x-ratelimit-limit');
+                const reset = header('x-ratelimit-reset');
+                if (remaining != null) {
+                  console.log(
+                    `[rate-limit] ${tag}: remaining=${remaining}/${limit != null ? limit : '?'}` +
+                    (reset != null ? `, reset epoch=${reset}` : '')
+                  );
+                }
+                return remaining != null ? Number(remaining) : null;
+              } catch (_) { return null; }
+            }
+
+            function formatComment(comment) {
+              let body = comment.content || '';
+
+              if (comment.suggestion_code && comment.existing_code) {
+                body += '\n\n**Suggestion:**\n';
+                body += fencedBlock(comment.suggestion_code, 'suggestion');
+              }
+
+              return body + '\n\n' + OCR_MARKER;
+            }
+
+            function formatCommentMarkdown(comment, error) {
+              let md = `### 📄 \`${comment.path}\``;
+              if (comment.start_line && comment.end_line) {
+                md += ` (L${comment.start_line}-L${comment.end_line})`;
+              }
+              md += '\n\n';
+              if (error) {
+                md += `⚠️ GitHub could not post this as an inline comment: ${error}\n\n`;
+              }
+              md += comment.content || '';
+
+              if (comment.suggestion_code && comment.existing_code) {
+                md += '\n\n<details><summary>💡 Suggested Change</summary>\n\n';
+                md += '**Before:**\n' + fencedBlock(comment.existing_code) + '\n\n';
+                md += '**After:**\n' + fencedBlock(comment.suggestion_code) + '\n\n';
+                md += '</details>';
+              }
+
+              return md;
+            }
+
+            function buildSummaryBody(totalCount, inlineCount, summaryCount, warnings, suppressedCount) {
+              let body = `🔍 **OpenCodeReview** found **${totalCount}** issue(s) in this PR.`;
+              if (totalCount > 0) {
+                body += `\n- ✅ ${inlineCount} posted as inline comment(s)`;
+                body += `\n- 📝 ${summaryCount} posted as summary`;
+                if (suppressedCount > 0) {
+                  body += `\n- 🔁 ${suppressedCount} suppressed as duplicate(s) of existing review comments`;
+                }
+              }
+              if (warnings.length > 0) {
+                body += `\n\n⚠️ ${warnings.length} warning(s) occurred during review.`;
+              }
+              return body;
+            }
+
+            function formatSummaryComments(summaryComments) {
+              let body = '';
+              for (const { comment } of summaryComments) {
+                body += '\n\n---\n\n';
+                body += formatCommentMarkdown(comment);
+              }
+              return body;
+            }
+
+            function fencedBlock(content, language = '') {
+              const text = String(content || '');
+              const fence = safeFence(text);
+              let block = fence + language + '\n' + text;
+              if (!text.endsWith('\n')) block += '\n';
+              return block + fence;
+            }
+
+            function safeFence(content) {
+              const matches = String(content || '').match(/`+/g) || [];
+              const maxTicks = matches.reduce((max, ticks) => Math.max(max, ticks.length), 0);
+              return '`'.repeat(Math.max(3, maxTicks + 1));
+            }
