@@ -13,10 +13,10 @@ override any of them by committing its own file of the same type.
 
 | File | Applies as |
 | --- | --- |
-| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Contributor Covenant 2.1; conduct reports go to `security@kantan-hp.app` |
-| [`SECURITY.md`](SECURITY.md) | Default security policy; private reporting via `security@kantan-hp.app` + advisories |
+| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Contributor Covenant 2.1; conduct reports go to GitHub private vulnerability reporting |
+| [`SECURITY.md`](SECURITY.md) | Default security policy; private reporting via GitHub Security Advisories |
 | [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) | Pre-fills the PR description in every repo |
-| [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE) | 🐞 Bug report + 💡 Idea / feature request issue forms, plus a chooser `config.yml` (security reports are deflected to `security@kantan-hp.app`) |
+| [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE) | 🐞 Bug report + 💡 Idea / feature request issue forms, plus a chooser `config.yml` (security reports are deflected to the Security Advisories tab) |
 
 These show up in each repo's community profile as *"inherited from the kantan-hp/.github
 repository."* Resolution order GitHub uses when a repo lacks its own copy: the repo's

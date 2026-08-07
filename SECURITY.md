@@ -9,11 +9,13 @@ default policy for every kantan-hp repository; a repo may publish its own
 **Please don't open a public issue, pull request, or discussion for a security problem** —
 that discloses it to everyone before there's a fix.
 
-Report it privately, either way:
+Report it privately via **GitHub — Report a vulnerability** on the affected repo's
+**Security ▸ Advisories** tab (where private reporting is enabled). This keeps the report
+and the fix in one place.
 
-- **GitHub** — use **Report a vulnerability** on the affected repo's **Security ▸ Advisories**
-  tab (where private reporting is enabled). This keeps the report and the fix in one place.
-- **Email** — **security@kantan-hp.app**.
+> Note: a dedicated security mailbox is not yet available (the kantan domain is not
+> registered). Until one is, GitHub private vulnerability reporting is the only reporting
+> channel — please use it rather than emailing any address you may find in older docs.
 
 Helpful to include:
 
@@ -36,7 +38,6 @@ XSS or injection that could run on an editor's or visitor's device, or a way to 
 a site's Cloudflare Pages project — is squarely in scope alongside the usual classes
 (auth, injection, secret exposure, RCE).
 
-The public web starter lives in
-[`kantan-hp`](https://github.com/kantan-hp/kantan-hp); the control panel and the mobile
-apps (iOS / Android) live in adjacent repositories. Report issues in any of them to the
-address above — you don't need to know which repo is at fault.
+The public web starter lives in [`kantan-hp/template`](https://github.com/kantan-hp/template);
+the control panel and the mobile apps (iOS / Android) live in adjacent repositories. Report
+issues in any of them to the channel above — you don't need to know which repo is at fault.

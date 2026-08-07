@@ -45,9 +45,9 @@ Kantan contributor).
 ## If something goes wrong
 
 Kantan is a small, mostly one-person project, so here's the honest version: if
-something crosses a line, email **security@kantan-hp.app** and it goes straight
-to the maintainer. Tell me what happened, where, and when — links or screenshots
-help.
+something crosses a line, report it via **GitHub — Report a vulnerability** on the affected
+repo's **Security ▸ Advisories** tab (a dedicated security mailbox is not yet available).
+Tell me what happened, where, and when — links or screenshots help.
 
 I'll read every report, look into it fairly, and keep your identity and the
 details private — the same respect for privacy the product is built on. Reporting

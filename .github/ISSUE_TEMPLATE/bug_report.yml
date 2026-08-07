@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Thanks for helping make Kantan better — keep it short, just enough for us to see what you see.
-        **Is it a security problem?** Don't post it here — email security@kantan-hp.app instead.
+        **Is it a security problem?** Don't post it here — use the Security ▸ Advisories tab (private reporting) instead.
   - type: textarea
     id: what
     attributes:
@@ -38,5 +38,5 @@ body:
     attributes:
       label: One quick check
       options:
-        - label: This isn't a security vulnerability (those go to security@kantan-hp.app).
+        - label: This isn't a security vulnerability (those go through the Security ▸ Advisories tab).
           required: true

@@ -2,7 +2,7 @@ blank_issues_enabled: false
 contact_links:
   - name: 🔒 Found a security problem?
     url: https://github.com/kantan-hp/.github/security/policy
-    about: Don't post it publicly. Read our security policy, email security@kantan-hp.app, or use this repo's Security ▸ Advisories tab.
+    about: Don't post it publicly. Read our security policy and use this repo's Security ▸ Advisories tab (private reporting).
   - name: 📚 Just need help?
-    url: https://github.com/kantan-hp/kantan-hp
-    about: The kantan-hp README covers setup and publishing your blog.
+    url: https://github.com/kantan-hp/template
+    about: The kantan-hp/template README covers setup and publishing your blog.
